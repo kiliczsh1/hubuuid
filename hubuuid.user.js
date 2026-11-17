@@ -8,6 +8,8 @@
 // @match        https://tieba.baidu.com/p/*
 // @grant        none
 // @license      MIT
+// @downloadURL  https://raw.githubusercontent.com/kiliczsh1/hubuuid/main/hubuuid.user.js
+// @updateURL    https://raw.githubusercontent.com/kiliczsh1/hubuuid/main/hubuuid.user.js
 // ==/UserScript==
 
 (function () {
