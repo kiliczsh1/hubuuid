@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         hubuuid
 // @namespace    https://github.com/kiliczsh1/hubuuid
-// @version      1.0.0
-// @description  把贴吧里出现的 GitHub 仓库文件名，自动变成可点击的链接
+// @version      2.0.0
+// @description  把贴吧里出现的 GitHub 仓库文件名，自动变成可点击的链接；支持导入多个仓库
 // @author       kiliczsh1
 // @match        https://tieba.baidu.com/f*
 // @match        https://tieba.baidu.com/p/*
@@ -18,31 +18,65 @@
     // ============ 配置区 ============
     // 默认值。页面右下角齿轮里可以改，改完存在你自己的浏览器里，不影响别人
     const DEFAULT_CONF = {
-        owner: '',
-        repo: '',
-        branch: 'main',
+        repos: [],      // [{owner, repo, branch}]，最多 MAX_REPOS 个
+        branch: 'main', // 导入地址里没写分支时用这个
         prefix: '',     // 留空 = 走 GitHub raw；填了就用这个前缀拼地址（比如换成加速镜像）
         forums: ''      // 只在哪些吧生效；留空 = 所有吧都生效
     };
 
-    const CONF_KEY = 'gg_repo_conf_v1';
+    const CONF_KEY = 'gg_repo_conf_v2';
+    const OLD_CONF_KEY = 'gg_repo_conf_v1';
+    const MAX_REPOS = 20;
 
-    let CONF = Object.assign({}, DEFAULT_CONF);
-    try {
-        const c = JSON.parse(localStorage.getItem(CONF_KEY) || 'null');
-        if (c && c.owner && c.repo) CONF = Object.assign({}, DEFAULT_CONF, c);
-    } catch (e) {}
+    let CONF = { repos: [], branch: 'main', prefix: '', forums: '' };
 
-    const confReady = () => !!(CONF.owner && CONF.repo);
+    // 读配置。v1 存的是单个仓库，这里自动升成仓库列表
+    (function loadConf() {
+        try {
+            const c = JSON.parse(localStorage.getItem(CONF_KEY) || 'null');
+            if (c && Array.isArray(c.repos)) {
+                CONF = Object.assign({}, DEFAULT_CONF, c);
+                CONF.repos = CONF.repos
+                    .filter(r => r && r.owner && r.repo)
+                    .map(r => ({ owner: r.owner, repo: r.repo, branch: r.branch || CONF.branch || 'main' }))
+                    .slice(0, MAX_REPOS);
+                return;
+            }
+            const old = JSON.parse(localStorage.getItem(OLD_CONF_KEY) || 'null');
+            if (old && old.owner && old.repo) {
+                CONF = {
+                    repos: [{ owner: old.owner, repo: old.repo, branch: old.branch || 'main' }],
+                    branch: 'main',
+                    prefix: old.prefix || '',
+                    forums: old.forums || ''
+                };
+            }
+        } catch (e) {}
+    })();
 
-    const baseUrl = () => {
+    const confReady = () => CONF.repos.length > 0;
+
+    const cacheKey = (r) => `gg_idx_${r.owner}_${r.repo}_${r.branch}`;
+
+    const apiUrl = (r) =>
+        `https://api.github.com/repos/${r.owner}/${r.repo}/contents/?ref=${encodeURIComponent(r.branch)}`;
+
+    // 生成文件地址：默认走 raw，md 可选走 GitHub 网页（渲染）
+    function fileUrl(f) {
+        const encoded = String(f.name).split('/').map(encodeURIComponent).join('/');
+        if (mdRenderOn() && /\.md$/i.test(f.name)) {
+            return `https://github.com/${f.owner}/${f.repo}/blob/${f.branch}/${encoded}`;
+        }
         const p = (CONF.prefix || '').trim();
-        if (p) return p.replace(/\/+$/, '') + '/';
-        return `https://raw.githubusercontent.com/${CONF.owner}/${CONF.repo}/${CONF.branch}/`;
-    };
-
-    const apiUrl = () =>
-        `https://api.github.com/repos/${CONF.owner}/${CONF.repo}/contents/?ref=${encodeURIComponent(CONF.branch)}`;
+        if (p) {
+            const base = p.replace(/\/+$/, '') + '/';
+            return base
+                .replace(/\{owner\}/g, f.owner)
+                .replace(/\{repo\}/g, f.repo)
+                .replace(/\{branch\}/g, f.branch) + encoded;
+        }
+        return `https://raw.githubusercontent.com/${f.owner}/${f.repo}/${f.branch}/${encoded}`;
+    }
 
     // 文件清单缓存多久（毫秒）。往仓库加了新文件，最多等这么久才会被认出来
     const CACHE_TTL = 60 * 60 * 1000;
@@ -67,7 +101,7 @@
     const SHOW_TOGGLE = true;
     // ================================
 
-    const modeKey = () => `gg_md_mode_${CONF.owner}_${CONF.repo}`;
+    const modeKey = () => `gg_md_mode_${CONF.repos.map(r => r.owner + '_' + r.repo).join('+') || 'none'}`;
 
     // 当前实际生效的模式：用户点过按钮就用用户的，否则用上面的默认值
     function mdRenderOn() {
@@ -86,15 +120,6 @@
     // 只有"文件名合法字符"组成的片段才允许拼接。
     // 含中文的（22分钟前 / 河南 / 赞 / 回复）一律不碰 —— 它们有自己的样式和位置。
     const NAME_CHUNK = /^[0-9A-Za-z._~\-]+$/;
-    // 生成文件地址：默认走 raw（直接给文件），md 可选走 GitHub 网页（渲染）
-    function urlFor(name) {
-        const encoded = name.split('/').map(encodeURIComponent).join('/');
-        if (mdRenderOn() && /\.md$/i.test(name)) {
-            return `https://github.com/${CONF.owner}/${CONF.repo}/blob/${CONF.branch}/${encoded}`;
-        }
-        return baseUrl() + encoded;
-    }
-
     // 判断这段字符有没有可能是某个文件名的开头 —— 拼接只在这条成立时才做
     function couldBePrefix(s) {
         if (!s) return false;
@@ -112,10 +137,9 @@
         return [m[0], t.slice(m[0].length)];
     }
 
-    const cacheKey = () => `gg_repo_index_${CONF.owner}_${CONF.repo}_${CONF.branch}`;
     // ================================
 
-    // 小写名 -> 仓库里的真实文件名
+    // 小写名 -> {name, owner, repo, branch}
     let FILE_MAP = new Map();
     let NAME_RE = null;
 
@@ -124,22 +148,26 @@
     function buildIndex(files) {
         FILE_MAP = new Map();
 
-        // 同一个名字对应多个扩展名时（a.md / a.jpg），不带扩展名的写法有歧义，不收录
+        // 同名不同扩展名（a.md / a.jpg）时，不带扩展名的写法有歧义，不收录
         const stemCount = new Map();
         files.forEach(f => {
-            if (!f) return;
-            const s = f.replace(/\.[^.]+$/, '').toLowerCase();
+            if (!f || !f.name) return;
+            const s = f.name.replace(/\.[^.]+$/, '').toLowerCase();
             stemCount.set(s, (stemCount.get(s) || 0) + 1);
         });
 
         files.forEach(f => {
-            if (!f || BLACKLIST.includes(f.toLowerCase())) return;
-            FILE_MAP.set(f.toLowerCase(), f);
+            if (!f || !f.name) return;
+            const low = f.name.toLowerCase();
+            if (BLACKLIST.includes(low)) return;
+
+            // 多个仓库有同名文件时，先到的优先
+            if (!FILE_MAP.has(low)) FILE_MAP.set(low, f);
 
             // 不带扩展名的写法也认：只对"够长、含数字、且唯一"的名字开，避免撞上普通英文单词
-            const stem = f.replace(/\.[^.]+$/, '');
+            const stem = f.name.replace(/\.[^.]+$/, '');
             const key = stem.toLowerCase();
-            if (stem.length >= 8 && /\d/.test(stem) && stemCount.get(key) === 1) {
+            if (stem.length >= 8 && /\d/.test(stem) && stemCount.get(key) === 1 && !FILE_MAP.has(key)) {
                 FILE_MAP.set(key, f);
             }
         });
@@ -195,8 +223,8 @@
         let hit = false;
 
         while ((match = NAME_RE.exec(text)) !== null) {
-            const realName = FILE_MAP.get(match[0].toLowerCase());
-            if (!realName) continue;
+            const f = FILE_MAP.get(match[0].toLowerCase());
+            if (!f) continue;
 
             hit = true;
 
@@ -207,8 +235,9 @@
             const end = eatNoise(text, NAME_RE.lastIndex);
 
             const a = document.createElement('a');
-            a.href = urlFor(realName);
-            a.dataset.file = realName;   // 记住真实文件名，切换模式时用来重算地址
+            a.href = fileUrl(f);
+            a.dataset.file = f.name;                              // 真实文件名
+            a.dataset.repo = `${f.owner}/${f.repo}/${f.branch}`;  // 来自哪个仓库，切换模式时重算地址用
             a.target = '_blank';
             a.rel = 'noopener noreferrer';
             a.title = a.href;
@@ -219,7 +248,7 @@
             fragments.push(a);
 
             // md 文件在链接后面跟一个切换小按钮
-            if (SHOW_TOGGLE && /\.md$/i.test(realName)) {
+            if (SHOW_TOGGLE && /\.md$/i.test(f.name)) {
                 const t = makeMdToggle();
                 t.textContent = mdRenderOn() ? '渲染' : '原文';
                 t.title = mdRenderOn()
@@ -239,7 +268,7 @@
         }
 
         const wrapper = document.createElement('span');
-        wrapper.setAttribute('data-repo-link', '1');
+        wrapper.setAttribute('data-repo-link', '1');   // 只作标记，不用于跳过
         // display:contents 让这层 span 不产生盒子，子节点直接按父级布局，
         // 这样不会把原本分行的内容挤到一行
         wrapper.style.display = 'contents';
@@ -302,17 +331,17 @@
 
             const [head, rest] = splitHead(t);
 
-            if (!prev) {
-                if (head && couldBePrefix(head)) prev = n;
-                return;   // "22分钟前""河南""赞""回复" 在这里就被挡掉了
-            }
+            if (!prev) { prev = n; return; }
 
-            const merged = prev.textContent + head;
-            if (head && couldBePrefix(merged)) {
-                prev.textContent = merged;
+            // 前一段可能是 "...看 17934" 这种，取它末尾的 ASCII 片段来拼
+            const tail = (prev.textContent.match(/([0-9A-Za-z._~\-]+)$/) || ['', ''])[1];
+            const merged = tail + head;
+
+            if (head && tail && couldBePrefix(merged)) {
+                prev.textContent += head;      // 接到前一段末尾
                 if (rest) n.textContent = rest; else dead.push(n);
             } else {
-                prev = null;
+                prev = n;                       // 拼不成，当前节点变成新的起点
             }
         });
         dead.forEach(n => n.remove());
@@ -322,7 +351,7 @@
         if (!el.tagName) return;
         if (/^(SCRIPT|STYLE|NOSCRIPT|A|TEXTAREA|INPUT|BUTTON)$/.test(el.tagName)) return;
         if (el.namespaceURI === 'http://www.w3.org/2000/svg') return;
-        if (el.getAttribute && el.getAttribute('data-repo-link')) return;
+        if (el.getAttribute && el.getAttribute('data-gg-skip')) return;
 
         try { mergeAroundEmoji(el); } catch (e) {}
         try { mergeInComment(el); } catch (e) {}
@@ -374,12 +403,12 @@
     }
 
     function statusText() {
-        if (!confReady()) return '还没配置仓库，点齿轮填上用户名和仓库名';
+        if (!confReady()) return '还没导入仓库，在下面粘贴一个仓库地址';
         const forum = forumLabel();
         const s = INDEX_STATE;
-        if (s.status === 'fail') return forum + ' ｜ 清单读取失败：' + s.msg;
+        if (s.status === 'fail') return forum + ' ｜ ' + s.msg;
         if (s.status === 'loading') return forum + ' ｜ 正在读取清单…';
-        if (s.status === 'stale') return forum + ' ｜ 清单已过期，正在更新…';
+        if (s.status === 'stale') return forum + ' ｜ 清单更新中…';
         return forum;
     }
 
@@ -440,6 +469,8 @@
             '.gg-status[data-state="ok"]{background:#eef8f0;color:#3f8a52}',
             '.gg-status[data-state="fail"]{background:#fdeeee;color:#c0443f}',
             '.gg-status[data-state="stale"]{background:#fdf6e8;color:#a97a22}',
+            '.gg-flash{font-size:11px;color:#d0453f;line-height:1.5;min-height:13px;margin-top:2px}',
+            '.gg-panel code{background:#f1f5fa;padding:1px 3px;border-radius:3px;font-size:11px;color:#41618a}',
             '.gg-hint{margin-top:9px;font-size:11px;color:#9aa9bb;line-height:1.55}'
         ].join('\n');
         document.head.appendChild(css);
@@ -453,76 +484,182 @@
 
         const panel = document.createElement('div');
         panel.className = 'gg-panel';
-        panel.setAttribute('data-repo-link', '1');
+        panel.setAttribute('data-gg-skip', '1');
         panel.innerHTML = [
             '<h4>仓库设置</h4>',
             '<div class="gg-status" data-state="idle">正在识别当前吧…</div>',
-            '<label><span>GitHub 用户名</span><input data-k="owner" placeholder="kiliczsh1"></label>',
-            '<label><span>仓库名</span><input data-k="repo" placeholder="tuituit"></label>',
-            '<label><span>分支</span><input data-k="branch" placeholder="main"></label>',
-            '<label><span>生效的吧（回车确认，留空=全部）</span><div class="gg-tags"></div><input data-k="forums" placeholder="输入吧名，按回车添加"></label>',
+            '<label><span>仓库列表（最多 ' + MAX_REPOS + ' 个）</span>',
+            '<div class="gg-tags" data-box="repos"></div>',
+            '<input data-import placeholder="粘贴仓库地址，回车导入">',
+            '<div class="gg-flash" data-flash></div>',
+            '</label>',
+            '<label><span>默认分支（地址里没写分支时用）</span><input data-k="branch" placeholder="main"></label>',
+            '<label><span>生效的吧（回车确认，留空 = 全部）</span>',
+            '<div class="gg-tags" data-box="forums"></div>',
+            '<input data-k="forums" placeholder="输入吧名，按回车添加">',
+            '</label>',
             '<label><span>自定义前缀（可留空）</span><input data-k="prefix" placeholder="https://raw.githubusercontent.com/..."></label>',
             '<div class="gg-btns">',
             '<button data-act="reset" type="button">恢复默认</button>',
             '<button data-act="save" type="button">保存并刷新</button>',
             '</div>',
             '<div class="gg-btns"><button data-act="reload" type="button">重新读取文件清单</button></div>',
-            '<div class="gg-hint">保存后页面会刷新。自定义前缀留空时，按上面的用户名/仓库/分支自动拼地址。</div>'
+            '<div class="gg-hint">导入支持 <code>github.com/用户名/仓库</code>、<code>用户名/仓库</code>、带 <code>/tree/分支</code> 的地址。前缀里可用 <code>{owner}</code> <code>{repo}</code> <code>{branch}</code> 占位。</div>'
         ].join('');
 
         let forumTags = [];
+        let repoList = [];
+        let flashTimer = null;
 
-        function renderTags() {
-            const box = panel.querySelector('.gg-tags');
+        function flashHint(msg) {
+            const el = panel.querySelector('[data-flash]');
+            if (!el) return;
+            el.textContent = msg;
+            clearTimeout(flashTimer);
+            flashTimer = setTimeout(() => { el.textContent = ''; }, 2000);
+        }
+
+        function makeChip(text, tip, onRemove) {
+            const t = document.createElement('span');
+            t.className = 'gg-tag';
+            t.textContent = text;
+            if (tip) t.title = tip;
+            const x = document.createElement('b');
+            x.textContent = '\u00d7';
+            x.addEventListener('click', onRemove);
+            t.appendChild(x);
+            return t;
+        }
+
+        function renderRepos() {
+            const box = panel.querySelector('.gg-tags[data-box="repos"]');
+            box.innerHTML = '';
+            repoList.forEach((r, i) => {
+                box.appendChild(makeChip(
+                    r.owner + '/' + r.repo,
+                    '分支：' + r.branch + '　点 × 移除',
+                    () => { repoList.splice(i, 1); renderRepos(); }
+                ));
+            });
+            box.style.display = repoList.length ? 'flex' : 'none';
+        }
+
+        function renderForums() {
+            const box = panel.querySelector('.gg-tags[data-box="forums"]');
             box.innerHTML = '';
             forumTags.forEach((name, i) => {
-                const t = document.createElement('span');
-                t.className = 'gg-tag';
-                t.textContent = name;
-                const x = document.createElement('b');
-                x.textContent = '\u00d7';
-                x.title = '删掉这个吧';
-                x.addEventListener('click', () => { forumTags.splice(i, 1); renderTags(); });
-                t.appendChild(x);
-                box.appendChild(t);
+                box.appendChild(makeChip(name, '点 × 移除', () => {
+                    forumTags.splice(i, 1);
+                    renderForums();
+                }));
             });
             box.style.display = forumTags.length ? 'flex' : 'none';
         }
 
-        function addTag(v) {
-            const s = String(v || '').trim().toLowerCase();
-            if (!s) return;
-            if (!forumTags.includes(s)) forumTags.push(s);
-            renderTags();
+        // 把用户粘进来的地址拆成 owner / repo / branch
+        function parseRepo(str) {
+            let t = String(str || '').trim();
+            if (!t) return null;
+            t = t.replace(/^[<（(]+|[>）)]+$/g, '').replace(/\.git$/i, '');
+
+            let m = t.match(/raw\.githubusercontent\.com\/([^\/\s]+)\/([^\/\s]+)\/([^\/\s]+)/i);
+            if (m) return { owner: m[1], repo: m[2], branch: m[3] };
+
+            m = t.match(/github\.com\/([^\/\s]+)\/([^\/\s?#]+)(?:\/(?:tree|blob)\/([^\/\s?#]+))?/i);
+            if (m) return { owner: m[1], repo: m[2], branch: m[3] || '' };
+
+            m = t.match(/^([\w.-]+)\/([\w.-]+)(?:@([\w.\/-]+))?$/);
+            if (m) return { owner: m[1], repo: m[2], branch: m[3] || '' };
+
+            return null;
+        }
+
+        function addRepo(r) {
+            if (!r || !r.owner || !r.repo) return false;
+            if (repoList.length >= MAX_REPOS) {
+                flashHint('最多 ' + MAX_REPOS + ' 个仓库');
+                return false;
+            }
+            const dup = repoList.some(x =>
+                x.owner.toLowerCase() === r.owner.toLowerCase() &&
+                x.repo.toLowerCase() === r.repo.toLowerCase()
+            );
+            if (dup) {
+                flashHint(r.owner + '/' + r.repo + ' 已经在列表里');
+                return false;
+            }
+            const defBranch = (panel.querySelector('input[data-k="branch"]').value || '').trim() || 'main';
+            repoList.push({
+                owner: r.owner,
+                repo: r.repo,
+                branch: r.branch || defBranch
+            });
+            renderRepos();
+            return true;
         }
 
         const fill = (src) => {
-            panel.querySelectorAll('input,textarea').forEach(inp => {
+            panel.querySelectorAll('input[data-k]').forEach(inp => {
                 if (inp.dataset.k === 'forums') return;
                 inp.value = src[inp.dataset.k] || '';
             });
+            repoList = (src.repos || []).map(r => ({
+                owner: r.owner,
+                repo: r.repo,
+                branch: r.branch || src.branch || 'main'
+            }));
+            renderRepos();
+
             forumTags = String(src.forums || '')
                 .split(/[\n,，、\s]+/)
                 .map(x => x.trim().toLowerCase())
                 .filter(Boolean);
-            renderTags();
+            renderForums();
         };
         fill(CONF);
+
+        // 粘贴仓库地址，回车导入
+        const importInp = panel.querySelector('input[data-import]');
+        importInp.addEventListener('keydown', (e) => {
+            if (e.key !== 'Enter') return;
+            e.preventDefault();
+            const r = parseRepo(importInp.value);
+            if (!r) {
+                flashHint('看不懂这个地址，试试 用户名/仓库');
+                return;
+            }
+            if (addRepo(r)) {
+                importInp.value = '';
+                flashHint('已加入 ' + r.owner + '/' + r.repo + '，记得点保存');
+            }
+        });
+        importInp.addEventListener('blur', () => {
+            if (!importInp.value.trim()) return;
+            const r = parseRepo(importInp.value);
+            if (r && addRepo(r)) importInp.value = '';
+        });
 
         // 回车（或逗号）确认一个吧名，退格删掉最后一个
         const fInp = panel.querySelector('input[data-k="forums"]');
         fInp.addEventListener('keydown', (e) => {
             if (e.key === 'Enter' || e.key === ',' || e.key === '，' || e.key === '、') {
                 e.preventDefault();
-                addTag(fInp.value);
+                const v = fInp.value.trim().toLowerCase();
+                if (v && !forumTags.includes(v)) forumTags.push(v);
                 fInp.value = '';
+                renderForums();
             } else if (e.key === 'Backspace' && !fInp.value && forumTags.length) {
                 forumTags.pop();
-                renderTags();
+                renderForums();
             }
         });
         fInp.addEventListener('blur', () => {
-            if (fInp.value.trim()) { addTag(fInp.value); fInp.value = ''; }
+            const v = fInp.value.trim().toLowerCase();
+            if (v && !forumTags.includes(v)) {
+                forumTags.push(v);
+                fInp.value = '';
+                renderForums();
+            }
         });
 
         gear.addEventListener('click', () => {
@@ -534,20 +671,21 @@
         });
 
         panel.querySelector('[data-act="save"]').addEventListener('click', () => {
-            const next = {};
-            panel.querySelectorAll('input,textarea').forEach(inp => {
+            if (!repoList.length) {
+                alert('先导入至少一个仓库');
+                return;
+            }
+            const next = { repos: repoList };
+            panel.querySelectorAll('input[data-k]').forEach(inp => {
                 if (inp.dataset.k === 'forums') return;
                 next[inp.dataset.k] = inp.value.trim();
             });
-            const fInp = panel.querySelector('input[data-k="forums"]');
-            addTag(fInp.value);          // 还没按回车的也收进去
-            fInp.value = '';
-            next.forums = forumTags.join('\n');
-            if (!next.owner || !next.repo) {
-                alert('用户名和仓库名不能为空');
-                return;
-            }
             if (!next.branch) next.branch = 'main';
+
+            const pending = fInp.value.trim().toLowerCase();
+            if (pending && !forumTags.includes(pending)) forumTags.push(pending);
+            next.forums = forumTags.join('\n');
+
             try {
                 localStorage.setItem(CONF_KEY, JSON.stringify(next));
             } catch (e) {
@@ -558,7 +696,9 @@
         });
 
         panel.querySelector('[data-act="reload"]').addEventListener('click', () => {
-            try { localStorage.removeItem(cacheKey()); } catch (e) {}
+            CONF.repos.forEach(r => {
+                try { localStorage.removeItem(cacheKey(r)); } catch (e) {}
+            });
             loadIndex(true);
         });
 
@@ -577,7 +717,15 @@
     // 切换模式后，把页面上已经生成的链接重新算一遍地址
     function refreshLinks() {
         document.querySelectorAll('a[data-file]').forEach(a => {
-            a.href = urlFor(a.dataset.file);
+            const parts = (a.dataset.repo || '').split('/');
+            if (parts.length < 3) return;
+            const f = {
+                name: a.dataset.file,
+                owner: parts[0],
+                repo: parts[1],
+                branch: parts.slice(2).join('/')
+            };
+            a.href = fileUrl(f);
             a.title = a.href;
         });
     }
@@ -621,9 +769,9 @@
     // status: idle | loading | ok | stale | fail
     const INDEX_STATE = { status: 'idle', count: 0, msg: '' };
 
-    function readCache(allowStale) {
+    function readCache(r, allowStale) {
         try {
-            const c = JSON.parse(localStorage.getItem(cacheKey()) || 'null');
+            const c = JSON.parse(localStorage.getItem(cacheKey(r)) || 'null');
             if (!c || !Array.isArray(c.files)) return null;
             if (!allowStale && Date.now() - c.t >= CACHE_TTL) return null;
             return c.files;
@@ -631,9 +779,9 @@
         return null;
     }
 
-    function writeCache(files) {
+    function writeCache(r, files) {
         try {
-            localStorage.setItem(cacheKey(), JSON.stringify({ t: Date.now(), files }));
+            localStorage.setItem(cacheKey(r), JSON.stringify({ t: Date.now(), files }));
         } catch (e) {}
     }
 
@@ -646,51 +794,78 @@
     }
 
     async function loadIndex(force) {
-        const fresh = force ? null : readCache(false);
-        if (fresh) {
-            buildIndex(fresh);
-            setIndexState('ok', fresh.length);
-            scan(document.body);
-            return;
-        }
+        const repos = CONF.repos.slice(0, MAX_REPOS);
+        if (!repos.length) return;
 
-        // 过期的也先拿来用，总比什么都不做强
-        const stale = readCache(true);
-        if (stale) {
-            buildIndex(stale);
-            setIndexState('stale', stale.length);
+        const all = [];
+        const addFiles = (r, names) => {
+            names.forEach(n => all.push({ name: n, owner: r.owner, repo: r.repo, branch: r.branch }));
+        };
+
+        // 先用各仓库的缓存（过期的也用），把能显示的立刻显示出来
+        const missing = [];
+        repos.forEach(r => {
+            const fresh = force ? null : readCache(r, false);
+            const usable = fresh || readCache(r, true);
+            if (usable) addFiles(r, usable);
+            if (!fresh) missing.push(r);
+        });
+
+        if (all.length) {
+            buildIndex(all);
             scan(document.body);
+            setIndexState('stale', all.length);
         } else {
             setIndexState('loading', 0);
         }
 
-        try {
-            const resp = await fetch(apiUrl(), {
-                headers: { Accept: 'application/vnd.github+json' },
-                cache: 'no-store'
-            });
-            if (!resp.ok) {
-                setIndexState('fail', 0, 'HTTP ' + resp.status + (resp.status === 403 || resp.status === 429 ? '（GitHub 限流，等下再试）' : ''));
-                return;
-            }
-            const list = await resp.json();
-            if (!Array.isArray(list)) {
-                setIndexState('fail', 0, '返回格式不对，检查用户名/仓库名');
-                return;
-            }
+        if (!missing.length) {
+            buildIndex(all);
+            setIndexState('ok', all.length);
+            return;
+        }
 
-            const files = list.filter(x => x.type === 'file').map(x => x.name);
-            if (!files.length) {
-                setIndexState('fail', 0, '仓库里没读到文件，检查分支名');
-                return;
+        // 缺的（或强制刷新时）逐个去拉
+        let failed = 0;
+        let lastMsg = '';
+        for (const r of missing) {
+            try {
+                const resp = await fetch(apiUrl(r), {
+                    headers: { Accept: 'application/vnd.github+json' },
+                    cache: 'no-store'
+                });
+                if (!resp.ok) {
+                    failed++;
+                    lastMsg = 'HTTP ' + resp.status + (resp.status === 403 || resp.status === 429 ? '（GitHub 限流）' : '');
+                    continue;
+                }
+                const list = await resp.json();
+                if (!Array.isArray(list)) {
+                    failed++;
+                    lastMsg = '返回格式不对，检查仓库名';
+                    continue;
+                }
+                const names = list.filter(x => x.type === 'file').map(x => x.name);
+                if (!names.length) {
+                    failed++;
+                    lastMsg = '仓库里没读到文件，检查分支名';
+                    continue;
+                }
+                writeCache(r, names);
+                addFiles(r, names);
+            } catch (e) {
+                failed++;
+                lastMsg = '网络请求失败';
             }
+        }
 
-            writeCache(files);
-            buildIndex(files);
-            setIndexState('ok', files.length);
-            scan(document.body);   // 清单到手，重扫一遍
-        } catch (e) {
-            setIndexState('fail', 0, '网络请求失败，检查网络或前缀');
+        buildIndex(all);
+        scan(document.body);
+
+        if (failed) {
+            setIndexState('fail', all.length, failed + ' 个仓库读取失败：' + lastMsg);
+        } else {
+            setIndexState('ok', all.length);
         }
     }
 
