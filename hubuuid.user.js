@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         hubuuid
 // @namespace    https://github.com/kiliczsh1/hubuuid
-// @version      2.0.0
-// @description  把贴吧里出现的 GitHub 仓库文件名，自动变成可点击的链接；支持导入多个仓库
+// @version      2.1.0
+// @description  把贴吧里出现的 GitHub 仓库文件名变成可点击链接，文本类文件弹窗预览；支持导入多个仓库
 // @author       kiliczsh1
 // @match        https://tieba.baidu.com/f*
 // @match        https://tieba.baidu.com/p/*
@@ -245,6 +245,15 @@
             a.style.textDecoration = 'none';
             a.style.borderBottom = '1px dashed #4a90d9';
             a.style.marginRight = LINK_GAP;
+
+            // 左键点开弹窗预览；Ctrl/⌘/Shift 点或中键仍然走浏览器默认行为
+            a.addEventListener('click', (ev) => {
+                if (ev.ctrlKey || ev.metaKey || ev.shiftKey || ev.button !== 0) return;
+                if (!previewKind(f.name)) return;   // 图片、压缩包、pdf 等直接开原链接
+                ev.preventDefault();
+                openPreview(f, a.href);
+            });
+
             fragments.push(a);
 
             // md 文件在链接后面跟一个切换小按钮
@@ -709,6 +718,316 @@
         paintGear();
     }
 
+    // ---------- 预览弹窗 ----------
+    const PREVIEW_CACHE = new Map();
+    const PREVIEW_MAX_TEXT = 2 * 1024 * 1024;
+
+    function rawUrl(f) {
+        const encoded = String(f.name).split('/').map(encodeURIComponent).join('/');
+        const p = (CONF.prefix || '').trim();
+        if (p) {
+            return p.replace(/\/+$/, '') + '/'
+                .replace(/\{owner\}/g, f.owner)
+                .replace(/\{repo\}/g, f.repo)
+                .replace(/\{branch\}/g, f.branch) + encoded;
+        }
+        return `https://raw.githubusercontent.com/${f.owner}/${f.repo}/${f.branch}/${encoded}`;
+    }
+
+    // 只有文本类才走弹窗预览，其它类型直接开原链接
+    function previewKind(name) {
+        const ext = (String(name).split('.').pop() || '').toLowerCase();
+        if (ext === 'md' || ext === 'markdown') return 'md';
+        if (/^(txt|json|js|mjs|cjs|ts|tsx|jsx|css|scss|less|html|htm|xml|yml|yaml|csv|tsv|log|ini|conf|cfg|sh|bat|ps1|py|go|java|c|h|cpp|cs|rs|rb|php|sql|toml|env|gitignore)$/.test(ext)) return 'text';
+        return '';
+    }
+
+    function pvEsc(s) {
+        return String(s)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;');
+    }
+
+    // 行内元素：先抽出行内代码，再处理链接、加粗、斜体、删除线
+    function pvInline(src) {
+        let t = pvEsc(src);
+        const codes = [];
+        t = t.replace(/`([^`]+)`/g, (m, c) => {
+            codes.push(c);
+            return '\u0001' + (codes.length - 1) + '\u0001';
+        });
+
+        t = t.replace(/\[([^\]]*)\]\(([^)\s]+)\)/g, (m, txt, url) => {
+            const u = url.trim();
+            if (!/^(https?:\/\/|#|\/|\.\/|\.\.\/)/i.test(u)) return txt;
+            return '<a href="' + pvEsc(u) + '" target="_blank" rel="noopener noreferrer">' + txt + '</a>';
+        });
+
+        t = t.replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>');
+        t = t.replace(/(^|[^*])\*([^*\s][^*]*)\*/g, '$1<i>$2</i>');
+        t = t.replace(/~~([^~]+)~~/g, '<del>$1</del>');
+
+        t = t.replace(/\u0001(\d+)\u0001/g, (m, i) => '<code>' + codes[+i] + '</code>');
+        return t;
+    }
+
+    function pvSplitRow(line) {
+        return line.replace(/^\s*\|/, '').replace(/\|\s*$/, '').split('|').map(s => s.trim());
+    }
+
+    // 极简 markdown 渲染。所有原文先转义，不解析原始 HTML。
+    function renderMarkdown(src) {
+        const lines = String(src).replace(/\r\n?/g, '\n').split('\n');
+        const out = [];
+        let i = 0;
+
+        while (i < lines.length) {
+            const line = lines[i];
+
+            // 代码块
+            if (/^```/.test(line)) {
+                const buf = [];
+                i++;
+                while (i < lines.length && !/^```/.test(lines[i])) { buf.push(lines[i]); i++; }
+                i++;
+                out.push('<pre><code>' + pvEsc(buf.join('\n')) + '</code></pre>');
+                continue;
+            }
+
+            if (!line.trim()) { i++; continue; }
+
+            // 分隔线
+            if (/^\s*(-{3,}|\*{3,}|_{3,})\s*$/.test(line)) { out.push('<hr>'); i++; continue; }
+
+            // 标题
+            const h = line.match(/^(#{1,6})\s+(.*)$/);
+            if (h) {
+                const lv = h[1].length;
+                out.push('<h' + lv + '>' + pvInline(h[2]) + '</h' + lv + '>');
+                i++;
+                continue;
+            }
+
+            // 引用
+            if (/^>\s?/.test(line)) {
+                const buf = [];
+                while (i < lines.length && /^>\s?/.test(lines[i])) {
+                    buf.push(lines[i].replace(/^>\s?/, ''));
+                    i++;
+                }
+                out.push('<blockquote>' + renderMarkdown(buf.join('\n')) + '</blockquote>');
+                continue;
+            }
+
+            // 表格（当前行含 | 且下一行是分隔行）
+            if (line.indexOf('|') >= 0 && i + 1 < lines.length && /^\s*\|?[\s:|-]*-[\s:|-]*$/.test(lines[i + 1])) {
+                const head = pvSplitRow(line);
+                i += 2;
+                const rows = [];
+                while (i < lines.length && lines[i].trim() && lines[i].indexOf('|') >= 0) {
+                    rows.push(pvSplitRow(lines[i]));
+                    i++;
+                }
+                let html = '<table><thead><tr>' + head.map(c => '<th>' + pvInline(c) + '</th>').join('') + '</tr></thead><tbody>';
+                rows.forEach(r => {
+                    html += '<tr>' + head.map((_, k) => '<td>' + pvInline(r[k] || '') + '</td>').join('') + '</tr>';
+                });
+                html += '</tbody></table>';
+                out.push(html);
+                continue;
+            }
+
+            // 列表
+            if (/^\s*([-*+]|\d+\.)\s+/.test(line)) {
+                const ordered = /^\s*\d+\./.test(line);
+                const items = [];
+                while (i < lines.length && /^\s*([-*+]|\d+\.)\s+/.test(lines[i])) {
+                    items.push(lines[i].replace(/^\s*([-*+]|\d+\.)\s+/, ''));
+                    i++;
+                }
+                const tag = ordered ? 'ol' : 'ul';
+                out.push('<' + tag + '>' + items.map(t => '<li>' + pvInline(t) + '</li>').join('') + '</' + tag + '>');
+                continue;
+            }
+
+            // 段落
+            const buf = [];
+            while (
+                i < lines.length &&
+                lines[i].trim() &&
+                !/^```/.test(lines[i]) &&
+                !/^#{1,6}\s/.test(lines[i]) &&
+                !/^>\s?/.test(lines[i]) &&
+                !/^\s*([-*+]|\d+\.)\s+/.test(lines[i]) &&
+                !/^\s*(-{3,}|\*{3,}|_{3,})\s*$/.test(lines[i])
+            ) {
+                buf.push(lines[i]);
+                i++;
+            }
+            if (buf.length) {
+                out.push('<p>' + pvInline(buf.join('\n')).replace(/\n/g, '<br>') + '</p>');
+            } else {
+                i++;
+            }
+        }
+
+        return out.join('\n');
+    }
+
+    function ensurePreview() {
+        let mask = document.querySelector('.gg-pv-mask');
+        if (mask) return mask;
+
+        const style = document.createElement('style');
+        style.textContent = [
+            '.gg-pv-mask{position:fixed;inset:0;z-index:2147483600;background:rgba(15,25,40,.45);display:none;align-items:center;justify-content:center;padding:24px}',
+            '.gg-pv-mask.on{display:flex}',
+            '.gg-pv{background:#fff;border-radius:12px;box-shadow:0 18px 56px rgba(10,25,45,.32);width:100%;max-width:880px;min-height:260px;max-height:82vh;display:flex;flex-direction:column;overflow:hidden;font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif}',
+            '.gg-pv-head{display:flex;align-items:center;gap:8px;padding:11px 14px;border-bottom:1px solid #e8eef5;flex:0 0 auto}',
+            '.gg-pv-title{font-size:13px;color:#22384f;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:0 1 auto}',
+            '.gg-pv-gap{flex:1 1 auto}',
+            '.gg-pv-tag{flex:0 0 auto;font-size:11px;color:#7b8ea6;background:#f1f5fa;border-radius:4px;padding:1px 6px}',
+            '.gg-pv-acts{flex:0 0 auto;display:flex;align-items:center;gap:6px}',
+            '.gg-pv-acts button,.gg-pv-acts a{font-size:12px;font-family:inherit;padding:3px 8px;border:1px solid #d5dfea;border-radius:6px;background:#fff;color:#5a7086;cursor:pointer;text-decoration:none;line-height:1.5}',
+            '.gg-pv-acts button:hover,.gg-pv-acts a:hover{background:#f5f8fc;border-color:#b9c8d9}',
+            '.gg-pv-acts [data-pv="close"]{font-size:16px;padding:0 8px;line-height:1.3}',
+            '.gg-pv-body{flex:1 1 auto;overflow:auto;padding:16px 18px;font-size:14px;line-height:1.7;color:#2d3f52}',
+            '.gg-pv-body img{max-width:100%;height:auto;display:block;margin:0 auto}',
+            '.gg-pv-frame{width:100%;height:62vh;border:0}',
+            '.gg-pv-plain{margin:0;font-family:Consolas,Menlo,monospace;font-size:13px;line-height:1.65;white-space:pre-wrap;word-break:break-word;color:#2d3f52}',
+            '.gg-pv-msg{padding:28px 0;text-align:center;color:#8b9bb0;font-size:13px;line-height:1.8}',
+            '.gg-pv-msg.err{color:#c0443f}',
+            '.gg-pv-md h1,.gg-pv-md h2,.gg-pv-md h3{margin:1.1em 0 .5em;line-height:1.35;color:#1f3550}',
+            '.gg-pv-md h1{font-size:1.5em;border-bottom:1px solid #e8eef5;padding-bottom:.3em}',
+            '.gg-pv-md h2{font-size:1.25em;border-bottom:1px solid #eef3f8;padding-bottom:.25em}',
+            '.gg-pv-md h3{font-size:1.08em}',
+            '.gg-pv-md p{margin:.7em 0}',
+            '.gg-pv-md ul,.gg-pv-md ol{margin:.6em 0;padding-left:1.6em}',
+            '.gg-pv-md li{margin:.25em 0}',
+            '.gg-pv-md code{background:#f1f5fa;padding:1px 4px;border-radius:3px;font-family:Consolas,Menlo,monospace;font-size:.9em;color:#b5425f}',
+            '.gg-pv-md pre{background:#f6f8fb;border:1px solid #e8eef5;border-radius:8px;padding:11px 13px;overflow:auto;margin:.8em 0}',
+            '.gg-pv-md pre code{background:none;padding:0;color:#2d3f52;font-size:12.5px;line-height:1.6}',
+            '.gg-pv-md blockquote{margin:.8em 0;padding:.2em 0 .2em 12px;border-left:3px solid #d5dfea;color:#63788f}',
+            '.gg-pv-md table{border-collapse:collapse;margin:.8em 0;font-size:13px;display:block;overflow:auto}',
+            '.gg-pv-md th,.gg-pv-md td{border:1px solid #e2eaf3;padding:6px 10px;text-align:left}',
+            '.gg-pv-md th{background:#f6f8fb;font-weight:600}',
+            '.gg-pv-md hr{border:0;border-top:1px solid #e8eef5;margin:1.2em 0}',
+            '.gg-pv-md a{color:#2f7bd4;text-decoration:none}',
+            '.gg-pv-md a:hover{text-decoration:underline}'
+        ].join('\n');
+        document.head.appendChild(style);
+
+        mask = document.createElement('div');
+        mask.className = 'gg-pv-mask';
+        mask.setAttribute('data-gg-skip', '1');
+        mask.innerHTML = [
+            '<div class="gg-pv">',
+            '<div class="gg-pv-head">',
+            '<span class="gg-pv-title"></span>',
+            '<span class="gg-pv-tag"></span>',
+            '<span class="gg-pv-gap"></span>',
+            '<div class="gg-pv-acts">',
+            '<button type="button" data-pv="mode" style="display:none"></button>',
+            '<a data-pv="open" target="_blank" rel="noopener noreferrer">新标签打开</a>',
+            '<button type="button" data-pv="close" title="关闭">\u00d7</button>',
+            '</div>',
+            '</div>',
+            '<div class="gg-pv-body"></div>',
+            '</div>'
+        ].join('');
+
+        mask.addEventListener('click', (e) => {
+            if (e.target === mask) closePreview();
+        });
+        mask.querySelector('[data-pv="close"]').addEventListener('click', closePreview);
+
+        document.body.appendChild(mask);
+        return mask;
+    }
+
+    function closePreview() {
+        const mask = document.querySelector('.gg-pv-mask');
+        if (mask) mask.classList.remove('on');
+    }
+
+    let pvCurrent = null;
+
+    function openPreview(f, href) {
+        const mask = ensurePreview();
+        const body = mask.querySelector('.gg-pv-body');
+        const titleEl = mask.querySelector('.gg-pv-title');
+        const tagEl = mask.querySelector('.gg-pv-tag');
+        const modeBtn = mask.querySelector('[data-pv="mode"]');
+        const openA = mask.querySelector('[data-pv="open"]');
+
+        const kind = previewKind(f.name) || 'text';
+        pvCurrent = { f: f, kind: kind };
+
+        titleEl.textContent = f.name;
+        titleEl.title = f.name;
+        tagEl.textContent = kind;
+        openA.href = href || rawUrl(f);
+
+        modeBtn.style.display = kind === 'md' ? '' : 'none';
+        modeBtn.textContent = mdRenderOn() ? '渲染' : '原文';
+
+        mask.classList.add('on');
+        body.innerHTML = '<div class="gg-pv-msg">加载中…</div>';
+
+        const key = f.owner + '/' + f.repo + '/' + f.branch + '/' + f.name;
+        const cached = PREVIEW_CACHE.get(key);
+        if (cached !== undefined) {
+            paintText(body, cached, kind);
+            return;
+        }
+
+        fetch(rawUrl(f), { cache: 'no-store' })
+            .then(r => {
+                if (!r.ok) throw new Error('HTTP ' + r.status);
+                return r.text();
+            })
+            .then(t => {
+                if (pvCurrent && pvCurrent.f.name !== f.name) return;   // 已经切到别的文件了
+                if (t.length > PREVIEW_MAX_TEXT) {
+                    body.innerHTML = '<div class="gg-pv-msg">文件太大了（' + Math.round(t.length / 1024) + ' KB），不适合在弹窗里预览。</div>';
+                    return;
+                }
+                PREVIEW_CACHE.set(key, t);
+                paintText(body, t, kind);
+            })
+            .catch(e => {
+                if (pvCurrent && pvCurrent.f.name !== f.name) return;
+                body.innerHTML = '<div class="gg-pv-msg err">读取失败：' + pvEsc(e.message) + '<br>可能是网络问题，或者仓库不是公开的。</div>';
+            });
+    }
+
+    function paintText(body, text, kind) {
+        if (kind === 'md' && mdRenderOn()) {
+            body.innerHTML = '<div class="gg-pv-md">' + renderMarkdown(text) + '</div>';
+            return;
+        }
+        const pre = document.createElement('pre');
+        pre.className = 'gg-pv-plain';
+        pre.textContent = text;
+        body.innerHTML = '';
+        body.appendChild(pre);
+    }
+
+    function refreshPreview() {
+        if (!pvCurrent) return;
+        const mask = document.querySelector('.gg-pv-mask');
+        if (!mask || !mask.classList.contains('on')) return;
+        const body = mask.querySelector('.gg-pv-body');
+        const modeBtn = mask.querySelector('[data-pv="mode"]');
+        modeBtn.textContent = mdRenderOn() ? '渲染' : '原文';
+        if (pvCurrent.kind !== 'md') return;
+        const key = pvCurrent.f.owner + '/' + pvCurrent.f.repo + '/' + pvCurrent.f.branch + '/' + pvCurrent.f.name;
+        const t = PREVIEW_CACHE.get(key);
+        if (t !== undefined) paintText(body, t, 'md');
+    }
+
     function scan(root) {
         if (!root) return;
         processElement(root);
@@ -760,6 +1079,7 @@
             setMdRender(!mdRenderOn());
             refreshLinks();
             syncToggles();
+            refreshPreview();
         });
 
         return btn;
@@ -870,7 +1190,21 @@
     }
 
     function init() {
-        mountSettings();   // 齿轮和面板任何吧都显示，方便随时改配置
+        mountSettings();
+
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') closePreview();
+        });
+
+        const pvMask = ensurePreview();
+        pvMask.querySelector('[data-pv="mode"]').addEventListener('click', () => {
+            setMdRender(!mdRenderOn());
+            refreshLinks();
+            syncToggles();
+            refreshPreview();
+        });
+
+        // 齿轮和面板任何吧都显示，方便随时改配置
 
         if (!confReady()) return;      // 没填仓库，什么都不做
         if (!forumAllowed()) return;   // 不在配置的吧里，不处理
